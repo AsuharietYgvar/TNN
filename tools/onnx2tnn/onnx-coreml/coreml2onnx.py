@@ -16,6 +16,8 @@ from onnx import helper, shape_inference
 from onnx import AttributeProto, TensorProto, GraphProto
 from onnx import numpy_helper
 
+import numpy as np
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('coreml_folder', help='Input coreml model folder')
@@ -125,6 +127,10 @@ def main():
             stride_y = 1
             if  ('stride_y' in layer_info):
                 stride_y = layer_info['stride_y']
+            
+            auto_pad = None
+            if layer_info['pad_mode'] == 1:
+                auto_pad = 'SAME_UPPER'
 
             node_inputs = layer_info['bottom'].split(',')
             if  ('blob_weights' in layer_info):
@@ -148,14 +154,24 @@ def main():
                                                                            blob_shape_dict['w']]))
 
             conv_group_num = layer_info['n_groups']
-            layer_node = helper.make_node('Conv', # node type
-                                          node_inputs, # inputs
-                                          node_conv_outputs, # outputs
-                                          kernel_shape = [layer_info['Nx'], layer_info['Ny']],
-                                          strides = [stride_x, stride_y],
-                                          pads = [layer_info['pad_l'], layer_info['pad_t'], layer_info['pad_r'], layer_info['pad_b']],
-                                          group = conv_group_num,
-                                          dilations = [1, 1])
+            if auto_pad:
+                layer_node = helper.make_node('Conv', # node type
+                                            node_inputs, # inputs
+                                            node_conv_outputs, # outputs
+                                            kernel_shape = [layer_info['Nx'], layer_info['Ny']],
+                                            strides = [stride_x, stride_y],
+                                            auto_pad = auto_pad,
+                                            group = conv_group_num,
+                                            dilations = [1, 1])
+            else:
+                layer_node = helper.make_node('Conv', # node type
+                                            node_inputs, # inputs
+                                            node_conv_outputs, # outputs
+                                            kernel_shape = [layer_info['Nx'], layer_info['Ny']],
+                                            strides = [stride_x, stride_y],
+                                            pads = [layer_info['pad_l'], layer_info['pad_t'], layer_info['pad_r'], layer_info['pad_b']],
+                                            group = conv_group_num,
+                                            dilations = [1, 1])
             onnx_net_nodes.append(layer_node)
 
             #weights
@@ -201,9 +217,16 @@ def main():
             node_inputs = layer_info['bottom'].split(',')
             node_type = ''
             node_inputs_extra = []
-            if  layer_info['operation'] == 0:
+            if  layer_info['operation'] == 2 or layer_info['operation'] == 0:
                 # check
                 node_type = 'Add'
+                if len(node_inputs) == 1:
+                    # scales
+                    scales_tensor_name = 'elementwise_' + layer_info['top']
+                    node_inputs_extra.append(scales_tensor_name)
+                    scales = [layer_info['alpha']]
+                    onnx_scales_tensor = helper.make_tensor(scales_tensor_name, TensorProto.FLOAT, [1], scales)
+                    onnx_net_weights.append(onnx_scales_tensor)
             elif layer_info['operation'] == 1:
                 # check 注意如果输如只有1个，需要像取[layer_info['alpha']]值
                 node_type = 'Mul'
@@ -214,8 +237,15 @@ def main():
                     scales = [layer_info['alpha']]
                     onnx_scales_tensor = helper.make_tensor(scales_tensor_name, TensorProto.FLOAT, [1], scales)
                     onnx_net_weights.append(onnx_scales_tensor)
-            elif layer_info['operation'] == 2:
+            elif layer_info['operation'] == -999:
                 node_type = 'Sub'
+                if len(node_inputs) == 1:
+                    # scales
+                    scales_tensor_name = 'elementwise_' + layer_info['top']
+                    node_inputs_extra.append(scales_tensor_name)
+                    scales = [layer_info['alpha']]
+                    onnx_scales_tensor = helper.make_tensor(scales_tensor_name, TensorProto.FLOAT, [1], scales)
+                    onnx_net_weights.append(onnx_scales_tensor)
             elif layer_info['operation'] == 3:
                 # check
                 node_type = 'Mul'
@@ -238,6 +268,23 @@ def main():
             elif layer_info['operation'] == 24:
                 # check
                 node_type = 'Abs'
+            elif layer_info['operation'] == 119:
+                node_type = 'Clip'
+                # check
+                alpha_tensor_name = 'elementwise_' + layer_info['top'] + 'alpha'
+                beta_tensor_name = 'elementwise_' + layer_info['top'] + 'beta'
+                node_inputs_extra.append(alpha_tensor_name)
+                node_inputs_extra.append(beta_tensor_name)
+                alpha = 0.0
+                if 'alpha' in layer_info:
+                    alpha = [layer_info['alpha']]
+                beta = 1.0
+                if 'beta' in layer_info:
+                    beta = [layer_info['beta']]
+                onnx_alpha_tensor = helper.make_tensor(alpha_tensor_name, TensorProto.FLOAT, [1], alpha)
+                onnx_beta_tensor = helper.make_tensor(beta_tensor_name, TensorProto.FLOAT, [1], beta)
+                onnx_net_weights.append(onnx_alpha_tensor)
+                onnx_net_weights.append(onnx_beta_tensor)
             else:
                 print('Error: unsupported elementwise operation: ' + str(layer_info['operation']))
                 assert(0)
@@ -352,6 +399,109 @@ def main():
         elif layer_info['type'] == 'load_constant':
             # constant_blob
             print('constant_blob: ' + str(layer_info['constant_blob']))
+        elif layer_info['type'] == 'batchnorm':
+            node_inputs = layer_info['bottom'].split(',')
+            weights_prefix = str(layer_info['blob_batchnorm_params'])
+            if  ('blob_batchnorm_params' in layer_info):
+                node_inputs.append(weights_prefix+'s')
+                node_inputs.append(weights_prefix+'bias')
+                # node_inputs.append(weights_prefix+'mean')
+                # node_inputs.append(weights_prefix+'var')
+
+            channels = layer_info['C']
+
+            node_bn_outputs = layer_info['top'].split(',')
+            data = np.array(net_layer_data[layer_info['blob_batchnorm_params']])
+            data = data.reshape([channels, 4])
+            s = data[:,0]
+            bias = data[:,1]
+            # mean = data[:,1]
+            # var = data[:,0]
+
+            training_mode = 0
+            if layer_info['training'] == 1:
+                # node_bn_outputs.append(layer_info['name']+'mean')
+                # node_bn_outputs.append(layer_info['name']+'var')
+                training_mode = 1
+
+            layer_node = helper.make_node('InstanceNormalization', # node type
+                                          node_inputs, # inputs
+                                          node_bn_outputs, # outputs
+                                          epsilon=layer_info['training_eps'])
+                                        #   momentum=layer_info['training_momentum'],
+                                          #training_mode=training_mode)
+            onnx_net_nodes.append(layer_node)
+
+            #weights
+            weights_shape = [layer_info['C']]
+            onnx_s_tensor = helper.make_tensor(weights_prefix+'s', TensorProto.FLOAT, weights_shape, s)
+            onnx_net_weights.append(onnx_s_tensor)
+            onnx_bias_tensor = helper.make_tensor(weights_prefix+'bias', TensorProto.FLOAT, weights_shape, bias)
+            onnx_net_weights.append(onnx_bias_tensor)
+            # onnx_mean_tensor = helper.make_tensor(weights_prefix+'mean', TensorProto.FLOAT, weights_shape, mean)
+            # onnx_net_weights.append(onnx_mean_tensor)
+            # onnx_var_tensor = helper.make_tensor(weights_prefix+'var', TensorProto.FLOAT, weights_shape, var)
+            # onnx_net_weights.append(onnx_var_tensor)
+        elif layer_info['type'] == 'inner_product':
+            stride_x = 1
+            if  ('stride_x' in layer_info):
+                stride_x = layer_info['stride_x']
+
+            stride_y = 1
+            if  ('stride_y' in layer_info):
+                stride_y = layer_info['stride_y']
+
+            node_inputs = layer_info['bottom'].split(',')
+            if  ('blob_weights' in layer_info):
+                node_inputs.append(str(layer_info['blob_weights']))
+            if  ('blob_biases' in layer_info):
+                node_inputs.append(str(layer_info['blob_biases']))
+
+            layer_info['Nx'] = 1
+            layer_info['Ny'] = 1
+
+            node_conv_outputs = layer_info['top'].split(',')
+            node_relu_outputs = []
+            if layer_info['has_relu'] == 1:
+                node_relu_outputs = node_conv_outputs
+                node_conv_outputs = []
+                for temp_output in node_relu_outputs:
+                    conv_output_blob_name = 'conv_'+temp_output
+                    node_conv_outputs.append(conv_output_blob_name)
+                    blob_shape_dict = net_layer_shapes[temp_output]
+                    onnx_blob_shapes.append(helper.make_tensor_value_info(conv_output_blob_name, TensorProto.FLOAT,
+                                                                          [blob_shape_dict['n'],
+                                                                           blob_shape_dict['k'],
+                                                                           blob_shape_dict['h'],
+                                                                           blob_shape_dict['w']]))
+
+            layer_node = helper.make_node('Conv', # node type
+                                          node_inputs, # inputs
+                                          node_conv_outputs, # outputs
+                                          kernel_shape = [layer_info['Nx'], layer_info['Ny']],
+                                          strides = [stride_x, stride_y],
+                                          pads = [0, 0, 0, 0],
+                                          group = 1,
+                                          dilations = [1, 1])
+            onnx_net_nodes.append(layer_node)
+
+            #weights
+            weights_shape = [layer_info['nC'], int(layer_info['nB']), layer_info['Nx'], layer_info['Ny']]
+            onnx_weights_tensor = helper.make_tensor(str(layer_info['blob_weights']), TensorProto.FLOAT, weights_shape, net_layer_data[layer_info['blob_weights']])
+            onnx_net_weights.append(onnx_weights_tensor)
+
+            #bias
+            if  ('blob_biases' in layer_info):
+                bias_shape = [layer_info['nC']]
+                onnx_bias_tensor = helper.make_tensor(str(layer_info['blob_biases']), TensorProto.FLOAT, bias_shape, net_layer_data[layer_info['blob_biases']])
+                onnx_net_weights.append(onnx_bias_tensor)
+
+            if layer_info['has_relu'] == 1:
+                layer_node = helper.make_node('Relu', # node type
+                                              node_conv_outputs, # inputs
+                                              node_relu_outputs, # outputs
+                                              )
+                onnx_net_nodes.append(layer_node)
         else:
             print('Error: unsupported layer type: ' + layer_info['type'])
             assert(0)
@@ -369,6 +519,9 @@ def main():
     #创建model (ModelProto)
     # onnx_model = helper.make_model(graph_def, producer_name='YouTu Tencent')
     onnx_model = helper.make_model(graph_def, producer_name='YouTu Tencent', opset_imports=[helper.make_operatorsetid("", 12)])
+    
+    # Change model version to support onnxruntime
+    onnx_model.ir_version = 7
 
     # print('The model is:\n{}'.format(onnx_model))
     onnx.checker.check_model(onnx_model)
